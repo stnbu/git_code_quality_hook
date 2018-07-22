@@ -1,0 +1,293 @@
+#!/usr/bin/env python
+"""Bare-minimum code quality checking:
+
+* PEP8, minus any configured exceptions
+* Require valid python syntax
+"""
+
+import sys
+import os
+import logging
+import subprocess
+import ast
+
+# 3rd party
+import pep8
+
+__author__ = 'Mike Burr <mburr@unintuitive.org'
+
+logging.basicConfig(level=logging.WARNING)
+logger = logging.getLogger(__name__)
+
+# A list of path prefexes to exclude from all checks.
+EXEMPT_PATH_PREFIXES = ['']
+
+pep8.DEFAULT_IGNORE = 'E123,E226,E24,E501,E127,E128'
+
+def git(command):
+    command.insert(0, 'git')
+    logger.debug('Executing: %s' % ' '.join(command))
+    p = subprocess.Popen(command, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE)
+    pout, perr = p.communicate()
+    if p.returncode:
+        command_string = ' '.join(command)
+        raise OSError('Command "%s" exited with %s! stderr was: %s' %
+                      (command_string, p.returncode, perr))
+    return pout, perr
+
+
+def get_refs():
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        old, new, branch = line.split()
+    return old, new, branch
+
+
+def get_sources(new, changed_paths):
+    command = 'ls-tree --full-name -r'.split()
+    command.append(new)
+    out, _ = git(command)
+    for line in out.splitlines():
+        if not line.strip():
+            logger.debug('Skipping empty line')
+            continue
+        try:
+            # https://git-scm.com/docs/git-ls-tree#_output_format
+            info, path = line.split('\t')
+            _, _, obj = info.split()
+        except Exception as e:
+            logger.critical('Unexpected line format: %s' % line)
+            raise e
+        if path not in changed_paths:
+            continue
+        if [p for p in EXEMPT_PATH_PREFIXES if path.startswith(p)]:
+            print('%s: exempted by configuration' % path)
+            continue
+        if not path.lower().endswith('.py'):
+            logger.debug('Not considering non-module "%s"' % path)
+            continue
+        source, _ = git(['cat-file', 'blob', obj])
+        yield source, path
+
+
+def get_pep8_violations(lines):
+    checker = pep8.Checker('', lines=lines, reporter=QuietReport)
+    checker.check_all()
+    return checker.report.get_error_lines()
+
+
+class QuietReport(pep8.BaseReport):
+    """A Quieter report class. Inspired by autopep8 source.
+    """
+    def __init__(self, options):
+        super(QuietReport, self).__init__(options)
+        self.__full_error_results = []
+
+    def error(self, line_number, offset, text, _):
+        code = super(QuietReport, self).error(line_number, offset, text, _)
+        if code:
+            self.__full_error_results.append(
+                {'id': code,
+                 'line': line_number,
+                 'column': offset + 1,
+                 'info': text})
+
+    def full_error_results(self):
+        return self.__full_error_results
+
+    def get_error_lines(self):
+        messages = []
+        for error in self.full_error_results():
+            message = '%s:%s\t%s' % (error['line'], error['column'],
+                                     error['info'])
+            messages.append(message)
+        return messages
+
+
+class ErrorFormatter(object):
+
+    def __init__(self, errors=[]):
+        self.errors = errors
+
+    def __str__(self):
+
+        separator_width = 100
+        issues_found_in = 'Issues found that prevent incorporation of your code.'
+
+        message = []
+        message.append('')
+        message.append('='*separator_width)
+        message.append(issues_found_in + ' See below.')
+        message.append('='*separator_width)
+        for error in self.errors:
+            message.append('-'*separator_width)
+            message.extend(error.header)
+            message.extend(error.body)
+        message.append('='*separator_width)
+        message.append(issues_found_in + ' See above.')
+        message.append('='*separator_width)
+        message.append('')
+        return '\n'.join(message)
+
+    def has_errors(self):
+        return self.errors
+
+    __unicode__ = __str__
+
+
+class ErrorType(object):
+
+    indentation = ' ' * 2
+
+    @property
+    def header(self):
+        raise NotImplementedError()
+
+    @property
+    def body(self):
+        raise NotImplementedError()
+
+
+class PEP8Errors(ErrorType):
+
+    def __init__(self, violations):
+        self.violations = violations
+
+    @property
+    def header(self):
+        return [self.indentation+'PEP8 Viloations Found...']
+
+    @property
+    def body(self):
+        for path, lines in self.violations:
+            yield self.indentation*2 + path
+            for line in lines:
+                yield self.indentation*4 + line
+
+
+class CompilationErrors(ErrorType):
+
+    def __init__(self, violations):
+        self.violations = violations
+
+    @property
+    def header(self):
+        return [self.indentation+'The following modules do not compile (syntax error?)']
+
+    @property
+    def body(self):
+        for path, message in self.violations:
+            line = self.indentation*2 + path + '\n'
+            message = [self.indentation*4 + l for l in message.splitlines()]
+            message = '\n'.join(message)
+            line += message + '\n'
+            line += '\n'
+            yield line
+
+
+def get_pathnames(changes, filter=None):
+    pathnames = []
+    for record in changes:
+        mode, path, new_path = record
+        if filter is None:
+            if new_path is not None:
+                pathnames.append(new_path)
+            else:
+                pathnames.append(path)
+        else:
+            for m in filter:
+                if m == mode:
+                    if m == 'R':
+                        pathnames.append(new_path)
+                    else:
+                        pathnames.append(path)
+    return pathnames
+
+
+def has_upper(string):
+    for a in string:
+        if a != a.lower():
+            return True
+    else:
+        return False
+
+
+def get_paths_containing_upper(files):
+    pathnames = []
+    for path in files:
+        if has_upper(path):
+            pathnames.append(path)
+    return pathnames
+
+
+def get_changes(old, new):
+    changes, _ = git(['diff', '--name-status', old + '..' + new])
+    changes = changes.splitlines()
+    changes = [l.split('\t') for l in changes]
+    # FIXME -- horrible horrible hack: get rid of the "score" for things like 'R0123'  (see git help diff)
+    changes = [[r[0][0]]+r[1:] for r in changes]
+    fixed_changes = []
+    for change in changes:
+        if len(change) == 3:
+            fixed_changes.append(change)
+        elif len(change) == 2:
+            fixed_changes.append(change+[None])
+        else:
+            raise Exception('Do not know what to do with "changes" record of length %s (change=%s)' % (len(change), change))
+    return fixed_changes
+
+
+def main():
+
+    global EXIT_STATUS
+
+    old, new, branch = get_refs()
+
+    if '0'*40 == old:
+        print('Branch creation detected. PEP8 checking bypassed.')
+        EXIT_STATUS = 0
+        return EXIT_STATUS
+
+    if '0'*40 == new:
+        print('Branch deletion detected. PEP8 checking bypassed.')
+        EXIT_STATUS = 0
+        return EXIT_STATUS
+
+    error_formatter = ErrorFormatter()
+
+    changes = get_changes(old, new)
+
+    paths_with_source_changes = get_pathnames(changes, filter=['A', 'M'])
+    all_compile_violations = []
+    for source, path in get_sources(new, paths_with_source_changes):
+        try:
+            ast.parse(source)
+        except Exception as e:
+            all_compile_violations.append((path, str(e)))
+    if all_compile_violations:
+        error_formatter.errors.append(CompilationErrors(violations=all_compile_violations))
+
+    # FIXME -- much of this stuff should be in the PEP8Errors class...
+    paths_with_source_changes = get_pathnames(changes, filter=['A', 'M'])
+    all_pep8_violations = []
+    for source, path in get_sources(new, paths_with_source_changes):
+        source = [l+'\n' for l in source.splitlines()]
+        violations = get_pep8_violations(source)
+        if violations:
+            all_pep8_violations.append((path, violations))
+    if all_pep8_violations:
+        error_formatter.errors.append(PEP8Errors(violations=all_pep8_violations))
+
+    if error_formatter.has_errors():
+        EXIT_STATUS = 2
+        print error_formatter
+    else:
+        EXIT_STATUS = 0
+
+    return EXIT_STATUS
+
+
+if __name__ == '__main__':
+    sys.exit(main())
