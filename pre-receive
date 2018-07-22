@@ -22,7 +22,8 @@ logger = logging.getLogger(__name__)
 # A list of path prefexes to exclude from all checks.
 EXEMPT_PATH_PREFIXES = ['']
 
-pep8.DEFAULT_IGNORE = 'E123,E226,E24,E501,E127,E128'
+# Add exceptions. Same syntax as `pep8 --ignore=XXX`
+pep8.DEFAULT_IGNORE = ''
 
 def git(command):
     command.insert(0, 'git')
